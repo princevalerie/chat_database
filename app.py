@@ -1,6 +1,8 @@
 import streamlit as st
 from pathlib import Path
 from langchain_community.agent_toolkits.sql.base import create_sql_agent
+from langchain_core.tools import Tool
+
 from langchain_community.utilities import SQLDatabase
 from langchain.agents.agent_types import AgentType
 
@@ -37,19 +39,21 @@ pg_host, pg_user, pg_password, pg_db = None, None, None, None
 mysql_host, mysql_user, mysql_password, mysql_db = None, None, None, None
 
 if selected_opt == radio_opt[0]:  # PostgreSQL
-
     db_uri = POSTGRES
     pg_host = st.sidebar.text_input("PostgreSQL Host").strip()
+    pg_port = st.sidebar.text_input("PostgreSQL Port", value="5432").strip()
     pg_user = st.sidebar.text_input("PostgreSQL User").strip()
     pg_password = st.sidebar.text_input("PostgreSQL Password", type="password")
     pg_db = st.sidebar.text_input("PostgreSQL Database Name").strip()
-elif selected_opt == radio_opt[1]:  # MySQL
 
+elif selected_opt == radio_opt[1]:  # MySQL
     db_uri = MYSQL
     mysql_host = st.sidebar.text_input("MySQL Host").strip()
+    mysql_port = st.sidebar.text_input("MySQL Port", value="3306").strip()
     mysql_user = st.sidebar.text_input("MySQL User").strip()
     mysql_password = st.sidebar.text_input("MySQL Password", type="password")
     mysql_db = st.sidebar.text_input("MySQL Database").strip()
+
 
 api_key = st.sidebar.text_input(label="Enter your Groq API Key", type="password")
 
@@ -93,7 +97,16 @@ def configure_db(db_uri, pg_host=None, pg_user=None, pg_password=None, pg_db=Non
 
         """Create a SQLDatabase instance with restricted table access and prevent DELETE/TRUNCATE"""
         inspector = inspect(engine)
-        existing_tables = inspector.get_table_names()
+        # Get tables from the application schema only
+        if db_uri == POSTGRES:
+            # For PostgreSQL, use the public schema by default
+            existing_tables = inspector.get_table_names(schema='public')
+        elif db_uri == MYSQL:
+            # For MySQL, get tables from the current database
+            with engine.connect() as conn:
+                schema = conn.exec_driver_sql("SELECT DATABASE()").scalar()
+            existing_tables = inspector.get_table_names(schema=schema)
+
 
             
         # Add event listener to prevent DELETE/TRUNCATE operations
@@ -104,13 +117,57 @@ def configure_db(db_uri, pg_host=None, pg_user=None, pg_password=None, pg_db=Non
                 if 'DELETE' in query or 'TRUNCATE' in query:
                     raise Exception("DELETE and TRUNCATE operations are not permitted")
             
+        # Detect schema and tables based on database type
+        if db_uri == POSTGRES:
+            # Get tables from the public schema for PostgreSQL
+            schemas = ['public']  # Focus on public schema only
+            all_tables = []
+            active_schema = 'public'
+
+                
+            # Find first accessible schema with tables
+            for schema in schemas:
+                try:
+                    tables = inspector.get_table_names(schema=schema)
+                    if tables:  # Use first schema with tables
+                        all_tables.extend(tables)
+                        active_schema = schema
+                        break
+                except Exception as e:
+                    st.warning(f"Could not access schema {schema}: {str(e)}")
+            
+            if not active_schema:
+                st.error("No accessible schemas found in the database")
+                st.stop()
+
+
+
+
+        elif db_uri == MYSQL:
+            # For MySQL, get the default schema and all tables
+            with engine.connect() as conn:
+                schema = conn.exec_driver_sql("SELECT DATABASE()").scalar() or 'public'
+                try:
+                    all_tables = inspector.get_table_names(schema=schema)
+                    active_schema = schema
+                except Exception as e:
+                    st.error(f"Could not access tables in schema {schema}: {str(e)}")
+                    all_tables = []
+                    active_schema = 'public'
+
+
+
+
+        
         return SQLDatabase(
             engine,
-            include_tables=existing_tables,
-            schema='public',
+            include_tables=all_tables if all_tables else existing_tables,
+            schema=active_schema,
             sample_rows_in_table_info=1,
             view_support=True
         )
+
+
 
 
 
@@ -127,7 +184,9 @@ def configure_db(db_uri, pg_host=None, pg_user=None, pg_password=None, pg_db=Non
             encoded_password = urllib.parse.quote(pg_password)
 
             # Corrected Connection String
-            db_url = f"postgresql+psycopg2://{pg_user}:{encoded_password}@{pg_host}/{pg_db}"
+            db_url = f"postgresql+psycopg2://{pg_user}:{encoded_password}@{pg_host}:{pg_port}/{pg_db}"
+
+
 
             print(f"Connecting to PostgreSQL: {db_url}")  # Debugging Output
             engine = create_engine(db_url)
@@ -143,7 +202,9 @@ def configure_db(db_uri, pg_host=None, pg_user=None, pg_password=None, pg_db=Non
             st.stop()
 
         try:
-            db_url = f"mysql+mysqlconnector://{mysql_user}:{mysql_password}@{mysql_host}/{mysql_db}"
+            db_url = f"mysql+mysqlconnector://{mysql_user}:{mysql_password}@{mysql_host}:{mysql_port}/{mysql_db}"
+
+
             print(f"Connecting to MySQL: {db_url}")  # Debugging Output
             engine = create_engine(db_url)
             return create_restricted_db(engine)
@@ -187,19 +248,49 @@ def safe_agent_run(query: str, *args, **kwargs):
     """Wrapper function to validate queries before execution"""
     if not validate_query(query):
         return "Access denied. DELETE and TRUNCATE operations are not permitted."
-    return agent.run(query, *args, **kwargs)
+    
+    # Add debug logging
+    st.info(f"Executing query: {query}")
+    try:
+        result = agent.run(query, *args, **kwargs)
+        st.info("Query executed successfully")
+        return result
+    except Exception as e:
+        st.error(f"Query execution failed: {str(e)}")
+        return f"Error: {str(e)}"
 
+# Enhanced SQL Agent with better error handling
 agent = create_sql_agent(
     llm=llm,
     toolkit=toolkit,
     verbose=True,
     agent_type=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
     handle_parsing_errors=True,
+    top_k=5,
+    max_iterations=10,
+    extra_tools=[
+        Tool(
+            name="sql_db_list_tables",
+            description="List all tables in the database",
+            func=lambda _: db.get_usable_table_names()
 
+        )
+    ],
 
-    top_k=5,  # Allow access to all approved tables
-    max_iterations=10  # Allow more complex queries within approved tables
+    early_stopping_method="generate",
+    return_intermediate_steps=True
 )
+
+# Add debug logging for table listing
+def list_tables_with_debug():
+    try:
+        tables = db.get_usable_table_names()
+        st.info(f"Found tables: {tables}")
+        return tables
+    except Exception as e:
+        st.error(f"Error listing tables: {str(e)}")
+        return []
+
 
 # Message history
 if "messages" not in st.session_state or st.sidebar.button("Clear message history"):
