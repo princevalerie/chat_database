@@ -22,9 +22,9 @@ st.set_page_config(page_title="Chat with your database")
 st.title("Chat with your database")
 
 # Define constants for database types
-LOCALDB = "USE_LOCALDB"
 POSTGRES = "USE_POSTGRES"
 MYSQL = "USE_MYSQL"
+
 
 # Sidebar - Choose database
 radio_opt = ["Connect to PostgreSQL Database", "Connect to MySQL Database"]
@@ -116,13 +116,8 @@ def configure_db(db_uri, pg_host=None, pg_user=None, pg_password=None, pg_db=Non
 
 
 
-    if db_uri == LOCALDB:
-        dbfilepath = (Path(__file__).parent / "student.db").absolute()
-        creator = lambda: sqlite3.connect(f"file:{dbfilepath}?mode=ro", uri=True)
-        engine = create_engine("sqlite:///", creator=creator)
-        return create_restricted_db(engine)
+    if db_uri == POSTGRES:
 
-    elif db_uri == POSTGRES:
         if not (pg_host and pg_user and pg_password and pg_db):
             st.error("❌ Please provide all PostgreSQL connection details.")
             st.stop()
